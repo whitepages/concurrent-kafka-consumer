@@ -1,0 +1,16 @@
+*.log.gz
+*.sc
+*.sw?
+.DS_Store
+target/
+.project
+.idea*
+/project.plugins/project
+ca.log
+reports/
+target/
+project/developer.sbt
+.history
+*.iml
+*.orig
+*.old
