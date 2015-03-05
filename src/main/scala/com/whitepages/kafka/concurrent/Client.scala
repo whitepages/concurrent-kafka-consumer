@@ -1,19 +1,20 @@
 package com.whitepages.kafka.concurrent
 
-import java.util.concurrent._
 
-import scala.collection.JavaConverters._
+import java.util.concurrent._
 
 import com.whitepages.kafka.consumer.ByteConsumer
 import com.whitepages.kafka.consumer.Consumer.Settings
 import kafka.consumer.ConsumerTimeoutException
 import kafka.message.MessageAndMetadata
-import org.slf4j.{LoggerFactory, Logger}
+import org.slf4j.{Logger, LoggerFactory}
+
+import scala.collection.JavaConverters._
 import scala.collection.mutable
-import scala.concurrent.Future
 import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
-import scala.concurrent.ExecutionContext.Implicits.global
+
 
 class ByteConsumerImpl(zk: String, topic: String, group: String, startAtEnd: Boolean = false) extends ByteConsumer {
   val timeout = 1.second
@@ -35,7 +36,7 @@ class ByteConsumerImpl(zk: String, topic: String, group: String, startAtEnd: Boo
 
 
 class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
-  import Ack._
+  import com.whitepages.kafka.concurrent.Ack._
 
   type Msg = MessageAndMetadata[String, Array[Byte]]
   case class AckableMessage(id: Long, msg: Msg, timestamp: Long)
@@ -48,8 +49,9 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
   private val syncPoint = new LinkedTransferQueue[AckableMessage]()
   private val outstandingAcks = new LinkedBlockingQueue[Acknowledgement]()
   private var shuttingDown = false
+  private var workerException: Option[Throwable] = None
 
-  private val t = new Thread( new Runnable {
+  private def newWorkerThread() = new Thread( new Runnable {
     val consumer = new ByteConsumerImpl(zk, topic, group, startAtEnd)
 
     val outstandingMessages = new mutable.HashMap[Long, AckableMessage]()
@@ -60,9 +62,10 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
 
     def run() {
       while (!shuttingDown) {
-
+//println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
         // commit if we can, and we've crossed a threshold
-        if (consumer.consumedCount > desiredCommitThreshold) {
+        if (consumer.consumedCount >= desiredCommitThreshold) {
+
           // gather acks seen so far
           val processingAcks = mutable.ListBuffer[Acknowledgement]()
           outstandingAcks.drainTo(processingAcks.asJava)
@@ -91,7 +94,9 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
 
           // commit if possible
           if (okToCommit) {
-            if (failedMessages.nonEmpty) failureHandler(failedMessages.toList)
+            if (failedMessages.nonEmpty) {
+              failureHandler(failedMessages.toList)
+            }
             consumer.commit()
             failedMessages.clear()
           }
@@ -99,18 +104,22 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
 
         // if we've exceeded the hard-commit threshold, stop giving out messages until we can commit,
         // which may not happen until all the outstanding messages time out
-        if (consumer.consumedCount < hardCommitThreshold || msgOnOffer.nonEmpty) {
-          try {
-            val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0))
-            msgOnOffer = None
-            if (!syncPoint.tryTransfer(nextMsg.copy(timestamp = System.currentTimeMillis()), 100, TimeUnit.MILLISECONDS))
-              msgOnOffer = Some(nextMsg) // nobody around, see if we can do some other work and try again later
-            else {
-              outstandingMessages += Tuple2(nextMsg.id, nextMsg)
-            }
+        if (consumer.consumedCount <= hardCommitThreshold || msgOnOffer.nonEmpty) {
+          // Cuts down on the cases where msgOnOffer is used.
+          // Since we only use syncPoint.take, it might preclude the need for msgOnOffer entirely.
+          if (syncPoint.hasWaitingConsumer) {
+            try {
+              val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0)).copy(timestamp = System.currentTimeMillis())
+              msgOnOffer = None
+              if (!syncPoint.tryTransfer(nextMsg))
+                msgOnOffer = Some(nextMsg) // nobody around, see if we can do some other work and try again later
+              else {
+                outstandingMessages += Tuple2(nextMsg.id, nextMsg)
+              }
 
-          } catch {
-            case e: ConsumerTimeoutException => Unit // No messages, try again later
+            } catch {
+              case e: ConsumerTimeoutException => Unit // No messages, try again later
+            }
           }
         }
 
@@ -119,30 +128,41 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     }
   })
 
+  private val t: Thread = newWorkerThread()   // TODO: Attempt to replace it if it stops?
+
   class UncaughtExceptionHandler extends Thread.UncaughtExceptionHandler {
-    override def uncaughtException(t: Thread, e: Throwable): Unit = println("Uncaught exception: " + e)  // TODO:
+    override def uncaughtException(t: Thread, e: Throwable): Unit = {
+      workerException = Some(e)
+      //println("Uncaught exception: " + e)
+    }
   }
 
 
-  def next: Future[AckableMessage] = {
+  def next(implicit ec: ExecutionContext): Future[AckableMessage] = {
+    if (workerException.isDefined) {
+      throw workerException.get
+    }
+    if (!running) {
+      throw new RuntimeException("Client worker is not running")
+    }
     Future {
       syncPoint.take
     }
   }
 
-  def ack(ack: Acknowledgement) = outstandingAcks.put(ack)
+  def ack(id: Long, ackType: Ack.AckType): Unit = ack(Ack(id, ackType))
+  def ack(ack: Acknowledgement): Unit = outstandingAcks.put(ack)
 
   def start(): ClientImpl = start(ignoreFailuresHandler)
   def start(handler: FailureHandler): ClientImpl = {
-    require(!started || handler == failureHandler, "Can't change the failure handler after start")
-
+    require(!running || handler == failureHandler, "Can't change the failure handler after start")
 
     failureHandler = handler
     t.setUncaughtExceptionHandler(new UncaughtExceptionHandler())
     t.start()
     this
   }
-  def started(): Boolean = t.isAlive
+  def running(): Boolean = t.isAlive
   def shutdown() = {
     shuttingDown = true
     t.join()
