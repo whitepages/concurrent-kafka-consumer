@@ -3,6 +3,8 @@ package com.whitepages.kafka.concurrent
 
 import java.util.concurrent._
 
+import com.whitepages.kafka.concurrent.Ack._
+import com.whitepages.kafka.concurrent.ClientImpl.AckableMessage
 import com.whitepages.kafka.consumer.ByteConsumer
 import com.whitepages.kafka.consumer.Consumer.Settings
 import kafka.consumer.ConsumerTimeoutException
@@ -34,16 +36,19 @@ class ByteConsumerImpl(zk: String, topic: String, group: String, startAtEnd: Boo
   }
 }
 
-
-class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
-  import com.whitepages.kafka.concurrent.Ack._
-
+object ClientImpl {
   type Msg = MessageAndMetadata[String, Array[Byte]]
   case class AckableMessage(id: Long, msg: Msg, timestamp: Long)
   case class AckedMessage(ackType: AckType, msg: Msg)
+}
+
+
+class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
+  import ClientImpl._
 
   val timeout = 3.second
   val hardCommitThreshold = desiredCommitThreshold * 2
+  val opportunisticCommitIdleDelay = timeout
 
   // these should be the ONLY pieces of /mutable/ shared data between this class and the inner thread
   private val syncPoint = new LinkedTransferQueue[AckableMessage]()
@@ -58,30 +63,30 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     val failedMessages = new mutable.Queue[AckedMessage]()
 
     var msgOnOffer: Option[AckableMessage] = None
+    var lastActivity = System.currentTimeMillis()
     def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
 
     def run() {
       while (!shuttingDown) {
 //println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
-        // commit if we can, and we've crossed a threshold
-        if (consumer.consumedCount >= desiredCommitThreshold) {
+        // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages, or if we apparently don't have anything better to do
+        if (consumer.consumedCount >= desiredCommitThreshold
+            || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
 
           // gather acks seen so far
           val processingAcks = mutable.ListBuffer[Acknowledgement]()
           outstandingAcks.drainTo(processingAcks.asJava)
 
           // remove acks from outstandingMessages
-          processingAcks.foreach((ack) => {
-            val msgOpt = outstandingMessages.remove(ack.id)
-            msgOpt.foreach(msg =>
-              ack.ackType match {
-                case ACK => Unit
-                case unsuccessfulAckCode => failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
-              }
-            )
-          })
+          for { ack <- processingAcks
+                msg <- outstandingMessages.remove(ack.id) } ack.ackType match {
+            case ACK => Unit
+            case unsuccessfulAckCode =>
+              failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
+          }
 
           // remove outstanding messages whose acks have expired
+          // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
           val expiredThreshold = System.currentTimeMillis() - timeout.toMillis
           outstandingMessages.foreach {
             case (id, ackableMsg) => {
@@ -107,6 +112,7 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
         if (consumer.consumedCount <= hardCommitThreshold || msgOnOffer.nonEmpty) {
           // Cuts down on the cases where msgOnOffer is used.
           // Since we only use syncPoint.take, it might preclude the need for msgOnOffer entirely.
+          // TODO: Performance of hasWaitingConsumer? Implied to be good, but untested.
           if (syncPoint.hasWaitingConsumer) {
             try {
               val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0)).copy(timestamp = System.currentTimeMillis())
@@ -114,12 +120,16 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
               if (!syncPoint.tryTransfer(nextMsg))
                 msgOnOffer = Some(nextMsg) // nobody around, see if we can do some other work and try again later
               else {
+                lastActivity = System.currentTimeMillis()
                 outstandingMessages += Tuple2(nextMsg.id, nextMsg)
               }
 
             } catch {
               case e: ConsumerTimeoutException => Unit // No messages, try again later
             }
+          }
+          else {
+            Thread.sleep(20) // nobody around, let's not spin-loop *too* fast.
           }
         }
 
