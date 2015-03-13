@@ -69,7 +69,8 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     def run() {
       while (!shuttingDown) {
 //println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
-        // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages, or if we apparently don't have anything better to do
+        // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages,
+        // or if we apparently don't have anything better to do
         if (consumer.consumedCount >= desiredCommitThreshold
             || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
 
@@ -129,7 +130,7 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
             }
           }
           else {
-            Thread.sleep(20) // nobody around, let's not spin-loop *too* fast.
+            Thread.sleep(50) // nobody around, let's not spin-loop *too* fast.
           }
         }
 

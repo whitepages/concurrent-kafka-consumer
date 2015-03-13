@@ -12,11 +12,13 @@ import scala.concurrent._
 import scala.util.Random
 import scala.concurrent.duration._
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.collection.JavaConverters._
+
 
 class TestClient extends FunSpec with BeforeAndAfterAll with BeforeAndAfterEach with Matchers {
   private[this] val kafka: MockKafka = new MockKafka()
   val testTopic = "testTopic"
-  val messageCount = 1000
+  val messageCount = 1000   // needs to be even, at the least.
   val messages = (0 to messageCount).map( _ => randomMessage )
   private[this] lazy val producer = new TestProducer(testTopic, kafka.brokerList)
   val failures = new ConcurrentLinkedQueue[AckedMessage]()
@@ -85,14 +87,12 @@ class TestClient extends FunSpec with BeforeAndAfterAll with BeforeAndAfterEach 
         .start((l) => l.foreach(failures.add))
 
       val failurePct = 15
-      val consumer = BuggyConsumer(client, failurePct, 0)
+      val timeoutPct = 0
+      val consumer = BuggyConsumer(client, failurePct, timeoutPct)
 
       val running = consumer.consumeInParallel(messageCount)
-      val results = Await.result(running, 1000.seconds)
+      val results = Await.result(running, 10.seconds)
       Thread.sleep(client.timeout.toMillis + 200)
-
-//      println("Acked: " + results.count(_._2 == Ack.ACK))
-//      println("Nacked: " + results.count(_._2 == Ack.NACK))
 
       consumer.nacked.size + consumer.acked.size should be(messageCount)
       failures.size() should be((messageCount * (failurePct / 100.0)).toInt +- messageCount / 10)
@@ -100,6 +100,31 @@ class TestClient extends FunSpec with BeforeAndAfterAll with BeforeAndAfterEach 
       client.shutdown()
     }
 
+    it("should handle multi-threaded nacks with timeouts") {
+      val client = new ClientImpl(kafka.zkConnect, testTopic, "multithreadedTimeoutGroup", messageCount / 4)
+        .start((l) => l.foreach(failures.add))
+
+      val failurePct = 10
+      val timeoutPct = 10
+      val consumer = BuggyConsumer(client, failurePct, timeoutPct)
+
+      val running = consumer.consumeInParallel(messageCount)
+      val results = Await.result(running, (messageCount / client.hardCommitThreshold) * client.timeout + 1.second)
+      val timeouts = results.filter(_._2 == Ack.TIMEOUT).map(_._1)
+      val nacks = results.filter(_._2 == Ack.NACK).map(_._1)
+      val acks = results.filter(_._2 == Ack.ACK).map(_._1)
+      acks.size + timeouts.size + nacks.size should be(results.size) // this really just tests the BuggyConsumer
+      Thread.sleep(client.timeout.toMillis + 200)
+
+      consumer.timeout.size + consumer.nacked.size + consumer.acked.size should be(messageCount)
+      failures.size() should be((messageCount * ((failurePct + timeoutPct) / 100.0)).toInt +- messageCount / 10)
+      failures.size() should be(consumer.nacked.size() + consumer.timeout.size())
+
+      timeouts.forall( ackable => failures.asScala.exists(_.msg.key() == ackable.msg.key() ) )
+      nacks.forall( ackable => failures.asScala.exists(_.msg.key() == ackable.msg.key()) )
+
+      client.shutdown()
+    }
 
     it("should explode if the failure handler explodes") {
       val client = new ClientImpl(kafka.zkConnect, testTopic, "explosiveGroup", 1)
