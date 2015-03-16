@@ -1,6 +1,7 @@
 package com.whitepages.kafka.concurrent
 
 
+import java.lang.Thread.UncaughtExceptionHandler
 import java.util.concurrent._
 
 import com.whitepages.kafka.concurrent.Ack._
@@ -40,43 +41,73 @@ object ClientImpl {
   type Msg = MessageAndMetadata[String, Array[Byte]]
   case class AckableMessage(id: Long, msg: Msg, timestamp: Long)
   case class AckedMessage(ackType: AckType, msg: Msg)
-}
+
+  // TODO: Are there other things the client might do (besides block) based on a return value from this function?
+  val ignoreFailuresHandler: FailureHandler = (failures) => Unit
+  type FailureHandler = (List[AckedMessage]) => Unit
+
+  sealed trait FailureHandlerResponse
+  case object Die extends FailureHandlerResponse
+  case object Rerun extends FailureHandlerResponse
+  case class Retry(msgs: Seq[Msg]) extends FailureHandlerResponse
 
 
-class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
-  import ClientImpl._
+  case class KafkaConnectionSettings(
+                                      zk: String,
+                                      topic: String,
+                                      group: String,
+                                      startAtEnd: Boolean = false
+  )
+  case class RunnableKafkaWorkerSharedState(
+                                           syncPoint: LinkedTransferQueue[AckableMessage], // read/write
+                                           outstandingAcks: LinkedBlockingQueue[Acknowledgement], // read/write
+                                           shutdownIndicator: () => Boolean, // read
+                                           failureHandler: () => FailureHandler // read
+  )
 
-  val timeout = 3.second
-  val hardCommitThreshold = desiredCommitThreshold * 2
-  val opportunisticCommitIdleDelay = timeout
 
-  // these should be the ONLY pieces of /mutable/ shared data between this class and the inner thread
-  private val syncPoint = new LinkedTransferQueue[AckableMessage]()
-  private val outstandingAcks = new LinkedBlockingQueue[Acknowledgement]()
-  private var shuttingDown = false
-  private var workerException: Option[Throwable] = None
+  class RunnableKafkaWorker(kafkaConnectionSettings: KafkaConnectionSettings,
+                            sharedState: RunnableKafkaWorkerSharedState,
+                            desiredCommitThreshold: Int,
+                            ackTimeout: FiniteDuration) extends Runnable {
 
-  private def newWorkerThread() = new Thread( new Runnable {
-    val consumer = new ByteConsumerImpl(zk, topic, group, startAtEnd)
+    // stop handing out messages if we exceed the hard threshold of uncommitted messages
+    val hardCommitThreshold = desiredCommitThreshold * 2
+    // if we've been idle this long, might as well try to do the housekeeping.
+    val opportunisticCommitIdleDelay = ackTimeout
+
+    val consumer = new ByteConsumerImpl(
+      kafkaConnectionSettings.zk,
+      kafkaConnectionSettings.topic,
+      kafkaConnectionSettings.group,
+      kafkaConnectionSettings.startAtEnd
+    )
 
     val outstandingMessages = new mutable.HashMap[Long, AckableMessage]()
     val failedMessages = new mutable.Queue[AckedMessage]()
 
+    // if we request a message from kafka, but find we don't have anyone to give it to, stash it here
+    // until we can hand it out to the next person to ask. This can block committing indefinitely, so it should be
+    // a rare event that this is nonEmpty.
     var msgOnOffer: Option[AckableMessage] = None
+    // keep an eye on whether we're idle, so we can commit when we have nothing better to do.
     var lastActivity = System.currentTimeMillis()
+
     def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
 
-    def run() {
-      while (!shuttingDown) {
-//println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
+
+    override def run(): Unit = {
+      while (!sharedState.shutdownIndicator()) {
+        //println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
+
         // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages,
         // or if we apparently don't have anything better to do
         if (consumer.consumedCount >= desiredCommitThreshold
-            || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
+          || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
 
           // gather acks seen so far
           val processingAcks = mutable.ListBuffer[Acknowledgement]()
-          outstandingAcks.drainTo(processingAcks.asJava)
+          sharedState.outstandingAcks.drainTo(processingAcks.asJava)
 
           // remove acks from outstandingMessages
           for { ack <- processingAcks
@@ -88,10 +119,11 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
 
           // remove outstanding messages whose acks have expired
           // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
-          val expiredThreshold = System.currentTimeMillis() - timeout.toMillis
+          val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
           outstandingMessages.foreach {
             case (id, ackableMsg) => {
               if (ackableMsg.timestamp < expiredThreshold) {
+                // return Cancellable futures and notify
                 failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
                 outstandingMessages.remove(id)
               }
@@ -101,7 +133,9 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
           // commit if possible
           if (okToCommit) {
             if (failedMessages.nonEmpty) {
-              failureHandler(failedMessages.toList)
+              // Block this thread's execution until the failureHandler completes.
+              // Exceptions during failureHandler execution escalate, and terminates all message processing.
+              sharedState.failureHandler()(failedMessages.toList)
             }
             consumer.commit()
             failedMessages.clear()
@@ -111,15 +145,17 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
         // if we've exceeded the hard-commit threshold, stop giving out messages until we can commit,
         // which may not happen until all the outstanding messages time out
         if (consumer.consumedCount <= hardCommitThreshold || msgOnOffer.nonEmpty) {
-          // Cuts down on the cases where msgOnOffer is used.
-          // Since we only use syncPoint.take, it might preclude the need for msgOnOffer entirely.
+          // Checking hasWaitingConsumer cuts down on the cases where msgOnOffer is used.
+          // If the other end only uses syncPoint.take, msgOnOffer should never be nonEmpty.
           // TODO: Performance of hasWaitingConsumer? Implied to be good, but untested.
-          if (syncPoint.hasWaitingConsumer) {
+          if (sharedState.syncPoint.hasWaitingConsumer) {
             try {
               val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0)).copy(timestamp = System.currentTimeMillis())
               msgOnOffer = None
-              if (!syncPoint.tryTransfer(nextMsg))
-                msgOnOffer = Some(nextMsg) // nobody around, see if we can do some other work and try again later
+              if (!sharedState.syncPoint.tryTransfer(nextMsg))
+                // Contrary to our previous understanding, there's nobody around,
+                // so see if we can do some other work and try again later
+                msgOnOffer = Some(nextMsg)
               else {
                 lastActivity = System.currentTimeMillis()
                 outstandingMessages += Tuple2(nextMsg.id, nextMsg)
@@ -137,18 +173,60 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
       }
       // TODO: shut the consumer down?
     }
-  })
 
-  private val t: Thread = newWorkerThread()   // TODO: Attempt to replace it if it stops?
+  }
+}
+
+
+class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
+  import ClientImpl._
+
+  val timeout = 3.second  // how long to wait for an Ack
+
+  // these should be the ONLY pieces of /mutable/ shared data between this class and the RunnableKafkaWorker
+  private val syncPoint = new LinkedTransferQueue[AckableMessage]()
+  private val outstandingAcks = new LinkedBlockingQueue[Acknowledgement]()
+  private var shuttingDown = false
+  private var workerException: Option[Throwable] = None
+  // The failure handler is a blocking method, executed by the RunnableKafkaWorker just prior to committing offsets.
+  // This means:
+  //   - Committing the outstanding messages cannot happen until this function finishes.
+  //   - Giving out more messages cannot happen while this function is running.
+  //   - Exceptions in this method are not caught, and will explode the RunnableKafkaWorker
+  private var failureHandler = ignoreFailuresHandler // set in start(), should never be changed after that
+  // TODO: Other types
+  // retry (reliable, in-memory-is-good-enough, etc)
+  // deadletter
+  // etc
+
+
+  private val sharedState = RunnableKafkaWorkerSharedState(
+    syncPoint,
+    outstandingAcks,
+    () => shuttingDown,
+    () => failureHandler
+  )
+  private val connectionSettings = KafkaConnectionSettings(zk, topic, group, startAtEnd)
 
   class UncaughtExceptionHandler extends Thread.UncaughtExceptionHandler {
     override def uncaughtException(t: Thread, e: Throwable): Unit = {
-      workerException = Some(e)
+      workerException = workerException.orElse(Some(e))
       //println("Uncaught exception: " + e)
     }
   }
 
+  // this manages the actual kafka client instance
+  private def newWorkerThread() = {
+    val t = new Thread(
+      new RunnableKafkaWorker(connectionSettings, sharedState, desiredCommitThreshold, timeout)
+    )
+    t.setUncaughtExceptionHandler(new UncaughtExceptionHandler())
+    t
+  }
 
+  private val t: Thread = newWorkerThread()   // TODO: Attempt to replace it if it stops?
+
+  // uses the caller's execution context to create a future message
   def next(implicit ec: ExecutionContext): Future[AckableMessage] = {
     if (workerException.isDefined) {
       throw workerException.get
@@ -169,7 +247,6 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     require(!running || handler == failureHandler, "Can't change the failure handler after start")
 
     failureHandler = handler
-    t.setUncaughtExceptionHandler(new UncaughtExceptionHandler())
     t.start()
     this
   }
@@ -179,15 +256,5 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     t.join()
     this
   }
-
-  // The failure handler is a blocking method, executed by the inner thread just prior to committing offsets.
-  //
-  // Committing the outstanding messages cannot happen until this function finishes.
-  // Giving out more messages cannot happen while this function is running.
-  // Exceptions in this method are not caught, and will explode the client class
-  // TODO: Are there other things the client might do (besides block) based on a return value from this function?
-  type FailureHandler = (List[AckedMessage]) => Unit
-  val ignoreFailuresHandler: FailureHandler = (failures) => Unit
-  private var failureHandler = ignoreFailuresHandler // set in start(), should never be changed after that
 
 }
