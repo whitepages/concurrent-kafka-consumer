@@ -12,6 +12,7 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.concurrent.blocking
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
@@ -239,7 +240,9 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
       throw new RuntimeException("Client worker is not running")
     }
     Future {
-      syncPoint.take
+      //This can block, let the execution context take care of it
+      //TODO: make default blocking execution context to provide to the users
+      blocking { syncPoint.take }
     }
   }
 
