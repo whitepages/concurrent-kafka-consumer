@@ -93,53 +93,16 @@ object ClientImpl {
     // keep an eye on whether we're idle, so we can commit when we have nothing better to do.
     var lastActivity = System.currentTimeMillis()
 
-    def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
+    private def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
 
+    private def isBored = consumer.consumedCount > 0 &&
+      System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis
 
     override def run(): Unit = {
       while (!sharedState.shutdownIndicator()) {
         //println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
 
-        // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages,
-        // or if we apparently don't have anything better to do
-        if (consumer.consumedCount >= desiredCommitThreshold
-          || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
-
-          // gather acks seen so far
-          val processingAcks = mutable.ListBuffer[Acknowledgement]()
-          sharedState.outstandingAcks.drainTo(processingAcks.asJava)
-
-          // remove acks from outstandingMessages
-          for {ack <- processingAcks
-               msg <- outstandingMessages.remove(ack.id)} ack.ackType match {
-            case ACK => Unit
-            case unsuccessfulAckCode =>
-              failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
-          }
-
-          // remove outstanding messages whose acks have expired
-          // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
-          val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
-          outstandingMessages.foreach {
-            case (id, ackableMsg) =>
-              if (ackableMsg.timestamp < expiredThreshold) {
-                // return Cancellable futures and notify
-                failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
-                outstandingMessages.remove(id)
-              }
-          }
-
-          // commit if possible
-          if (okToCommit) {
-            if (failedMessages.nonEmpty) {
-              // Block this thread's execution until the failureHandler completes.
-              // Exceptions during failureHandler execution escalate, and terminates all message processing.
-              sharedState.failureHandler()(failedMessages.toList)
-            }
-            consumer.commit()
-            failedMessages.clear()
-          }
-        }
+        if (consumer.consumedCount >= desiredCommitThreshold || isBored) doHousekeeping()
 
         // if we've exceeded the hard-commit threshold, stop giving out messages until we can commit,
         // which may not happen until all the outstanding messages time out
@@ -173,6 +136,48 @@ object ClientImpl {
       // TODO: shut the consumer down?
     }
 
+    /**
+     * Processes all acks seen so far, removes acks that have expired, enqueue failure messages if unsuccessful
+     * acks are seen. Possibly commits if its 'okToCommit'
+     */
+    private def doHousekeeping(): Unit = {
+      // gather acks seen so far
+      val processingAcks = mutable.ListBuffer[Acknowledgement]()
+      sharedState.outstandingAcks.drainTo(processingAcks.asJava)
+
+      // remove acks from outstandingMessages
+      for {
+        ack <- processingAcks
+        msg <- outstandingMessages.remove(ack.id)
+      } yield ack.ackType match {
+        case ACK => Unit
+        case unsuccessfulAckCode =>
+          failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
+      }
+
+      // remove outstanding messages whose acks have expired
+      // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
+      val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
+      outstandingMessages.foreach {
+        case (id, ackableMsg) =>
+          if (ackableMsg.timestamp < expiredThreshold) {
+            // return Cancellable futures and notify
+            failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
+            outstandingMessages.remove(id)
+          }
+      }
+
+      // commit if possible
+      if (okToCommit) {
+        if (failedMessages.nonEmpty) {
+          // Block this thread's execution until the failureHandler completes.
+          // Exceptions during failureHandler execution escalate, and terminates all message processing.
+          sharedState.failureHandler()(failedMessages.toList)
+        }
+        consumer.commit()
+        failedMessages.clear()
+      }
+    }
   }
 
 }
