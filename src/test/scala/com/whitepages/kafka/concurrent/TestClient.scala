@@ -109,7 +109,7 @@ class TestClient extends FunSpec with BeforeAndAfterAll with BeforeAndAfterEach 
       val consumer = BuggyConsumer(client, failurePct, timeoutPct)
 
       val running = consumer.consumeInParallel(messageCount)
-      val results = Await.result(running, (messageCount / client.hardCommitThreshold) * client.timeout + 1.second)
+      val results = Await.result(running, (messageCount / (client.desiredCommitThreshold * 2)) * client.timeout + 1.second)
       val timeouts = results.filter(_._2 == Ack.TIMEOUT).map(_._1)
       val nacks = results.filter(_._2 == Ack.NACK).map(_._1)
       val acks = results.filter(_._2 == Ack.ACK).map(_._1)

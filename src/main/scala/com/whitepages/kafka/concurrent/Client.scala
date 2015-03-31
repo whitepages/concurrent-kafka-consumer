@@ -178,7 +178,7 @@ object ClientImpl {
 }
 
 
-class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
+class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
   import ClientImpl._
 
   val timeout = 3.second  // how long to wait for an Ack
@@ -198,7 +198,6 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
   // retry (reliable, in-memory-is-good-enough, etc)
   // deadletter
   // etc
-
 
   private val sharedState = RunnableKafkaWorkerSharedState(
     syncPoint,
