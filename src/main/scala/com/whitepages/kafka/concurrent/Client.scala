@@ -1,11 +1,9 @@
 package com.whitepages.kafka.concurrent
 
 
-import java.lang.Thread.UncaughtExceptionHandler
 import java.util.concurrent._
 
 import com.whitepages.kafka.concurrent.Ack._
-import com.whitepages.kafka.concurrent.ClientImpl.AckableMessage
 import com.whitepages.kafka.consumer.ByteConsumer
 import com.whitepages.kafka.consumer.Consumer.Settings
 import kafka.consumer.ConsumerTimeoutException
@@ -39,7 +37,9 @@ class ByteConsumerImpl(zk: String, topic: String, group: String, startAtEnd: Boo
 
 object ClientImpl {
   type Msg = MessageAndMetadata[String, Array[Byte]]
+
   case class AckableMessage(id: Long, msg: Msg, timestamp: Long)
+
   case class AckedMessage(ackType: AckType, msg: Msg)
 
   // TODO: Are there other things the client might do (besides block) based on a return value from this function?
@@ -47,23 +47,23 @@ object ClientImpl {
   type FailureHandler = (List[AckedMessage]) => Unit
 
   sealed trait FailureHandlerResponse
+
   case object Die extends FailureHandlerResponse
+
   case object Rerun extends FailureHandlerResponse
+
   case class Retry(msgs: Seq[Msg]) extends FailureHandlerResponse
 
 
-  case class KafkaConnectionSettings(
-                                      zk: String,
-                                      topic: String,
-                                      group: String,
-                                      startAtEnd: Boolean = false
-  )
-  case class RunnableKafkaWorkerSharedState(
-                                           syncPoint: LinkedTransferQueue[AckableMessage], // read/write
-                                           outstandingAcks: LinkedBlockingQueue[Acknowledgement], // read/write
-                                           shutdownIndicator: () => Boolean, // read
-                                           failureHandler: () => FailureHandler // read
-  )
+  case class KafkaConnectionSettings(zk: String,
+                                     topic: String,
+                                     group: String,
+                                     startAtEnd: Boolean = false)
+
+  case class RunnableKafkaWorkerSharedState(syncPoint: LinkedTransferQueue[AckableMessage], // read/write
+                                            outstandingAcks: LinkedBlockingQueue[Acknowledgement], // read/write
+                                            shutdownIndicator: () => Boolean, // read
+                                            failureHandler: () => FailureHandler) // read
 
 
   class RunnableKafkaWorker(kafkaConnectionSettings: KafkaConnectionSettings,
@@ -110,8 +110,8 @@ object ClientImpl {
           sharedState.outstandingAcks.drainTo(processingAcks.asJava)
 
           // remove acks from outstandingMessages
-          for { ack <- processingAcks
-                msg <- outstandingMessages.remove(ack.id) } ack.ackType match {
+          for {ack <- processingAcks
+               msg <- outstandingMessages.remove(ack.id)} ack.ackType match {
             case ACK => Unit
             case unsuccessfulAckCode =>
               failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
@@ -153,8 +153,8 @@ object ClientImpl {
               val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0)).copy(timestamp = System.currentTimeMillis())
               msgOnOffer = None
               if (!sharedState.syncPoint.tryTransfer(nextMsg))
-                // Contrary to our previous understanding, there's nobody around,
-                // so see if we can do some other work and try again later
+              // Contrary to our previous understanding, there's nobody around,
+              // so see if we can do some other work and try again later
                 msgOnOffer = Some(nextMsg)
               else {
                 lastActivity = System.currentTimeMillis()
@@ -175,13 +175,15 @@ object ClientImpl {
     }
 
   }
+
 }
 
 
 class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
+
   import ClientImpl._
 
-  val timeout = 3.second  // how long to wait for an Ack
+  val timeout = 3.second // how long to wait for an Ack
 
   // these should be the ONLY pieces of /mutable/ shared data between this class and the RunnableKafkaWorker
   private val syncPoint = new LinkedTransferQueue[AckableMessage]()
@@ -224,7 +226,7 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     t
   }
 
-  private val t: Thread = newWorkerThread()   // TODO: Attempt to replace it if it stops?
+  private val t: Thread = newWorkerThread() // TODO: Attempt to replace it if it stops?
 
   // uses the caller's execution context to create a future message
   def next(implicit ec: ExecutionContext): Future[AckableMessage] = {
@@ -240,9 +242,11 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
   }
 
   def ack(id: Long, ackType: Ack.AckType): Unit = ack(Ack(id, ackType))
+
   def ack(ack: Acknowledgement): Unit = outstandingAcks.put(ack)
 
   def start(): ClientImpl = start(ignoreFailuresHandler)
+
   def start(handler: FailureHandler): ClientImpl = {
     require(!running || handler == failureHandler, "Can't change the failure handler after start")
 
@@ -250,7 +254,9 @@ class ClientImpl(zk: String, topic: String, group: String, desiredCommitThreshol
     t.start()
     this
   }
+
   def running(): Boolean = t.isAlive
+
   def shutdown() = {
     shuttingDown = true
     t.join()
