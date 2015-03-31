@@ -231,7 +231,12 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
 
   private val t: Thread = newWorkerThread() // TODO: Attempt to replace it if it stops?
 
-  // uses the caller's execution context to create a future message
+  /**
+   * Get the next message from the kafka topic
+   * @param ec implicit execution context used to create the future
+   * @return Future containing an AckableMessage with the message from Kafka. This message should be acked at some
+   *         point in the future by the caller
+   */
   def next(implicit ec: ExecutionContext): Future[AckableMessage] = {
     if (workerException.isDefined) {
       throw workerException.get
@@ -246,12 +251,30 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
     }
   }
 
+  /**
+   * Ack a message with a particular id and type
+   * @param id Id of message to Ack
+   * @param ackType Type of ack this is (fail, ack, nack, etc.)
+   */
   def ack(id: Long, ackType: Ack.AckType): Unit = ack(Ack(id, ackType))
 
+  /**
+   * Acks a message
+   * @param ack Ack object containing info needed to ack a particular message
+   */
   def ack(ack: Acknowledgement): Unit = outstandingAcks.put(ack)
 
+  /**
+   * Create and start a ClientImpl with the default failure handler (IgnoreFailuresHandler, which throws away all failures)
+   * @return The created and started ClientImpl
+   */
   def start(): ClientImpl = start(ignoreFailuresHandler)
 
+  /**
+   * Create and start a ClientImpl with the user defined failure handler
+   * @param handler Function that takes a list of failed AckedMessages and does something with them
+   * @return Created and started ClientImpl
+   */
   def start(handler: FailureHandler): ClientImpl = {
     require(!running || handler == failureHandler, "Can't change the failure handler after start")
 
@@ -260,8 +283,15 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
     this
   }
 
+  /**
+   * @return true if the ClientImpl is running, false otherwise
+   */
   def running(): Boolean = t.isAlive
 
+  /**
+   * Shutdown the ClientImpl
+   * @return itself
+   */
   def shutdown() = {
     shuttingDown = true
     t.join()
