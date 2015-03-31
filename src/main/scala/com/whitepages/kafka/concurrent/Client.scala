@@ -121,13 +121,12 @@ object ClientImpl {
           // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
           val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
           outstandingMessages.foreach {
-            case (id, ackableMsg) => {
+            case (id, ackableMsg) =>
               if (ackableMsg.timestamp < expiredThreshold) {
                 // return Cancellable futures and notify
                 failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
                 outstandingMessages.remove(id)
               }
-            }
           }
 
           // commit if possible
