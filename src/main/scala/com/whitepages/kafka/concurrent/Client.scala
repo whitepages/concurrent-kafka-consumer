@@ -1,11 +1,9 @@
 package com.whitepages.kafka.concurrent
 
 
-import java.lang.Thread.UncaughtExceptionHandler
 import java.util.concurrent._
 
 import com.whitepages.kafka.concurrent.Ack._
-import com.whitepages.kafka.concurrent.ClientImpl.AckableMessage
 import com.whitepages.kafka.consumer.ByteConsumer
 import com.whitepages.kafka.consumer.Consumer.Settings
 import kafka.consumer.ConsumerTimeoutException
@@ -14,6 +12,7 @@ import org.slf4j.{Logger, LoggerFactory}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.concurrent.blocking
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
@@ -39,7 +38,9 @@ class ByteConsumerImpl(zk: String, topic: String, group: String, startAtEnd: Boo
 
 object ClientImpl {
   type Msg = MessageAndMetadata[String, Array[Byte]]
+
   case class AckableMessage(id: Long, msg: Msg, timestamp: Long)
+
   case class AckedMessage(ackType: AckType, msg: Msg)
 
   // TODO: Are there other things the client might do (besides block) based on a return value from this function?
@@ -47,23 +48,23 @@ object ClientImpl {
   type FailureHandler = (List[AckedMessage]) => Unit
 
   sealed trait FailureHandlerResponse
+
   case object Die extends FailureHandlerResponse
+
   case object Rerun extends FailureHandlerResponse
+
   case class Retry(msgs: Seq[Msg]) extends FailureHandlerResponse
 
 
-  case class KafkaConnectionSettings(
-                                      zk: String,
-                                      topic: String,
-                                      group: String,
-                                      startAtEnd: Boolean = false
-  )
-  case class RunnableKafkaWorkerSharedState(
-                                           syncPoint: LinkedTransferQueue[AckableMessage], // read/write
-                                           outstandingAcks: LinkedBlockingQueue[Acknowledgement], // read/write
-                                           shutdownIndicator: () => Boolean, // read
-                                           failureHandler: () => FailureHandler // read
-  )
+  case class KafkaConnectionSettings(zk: String,
+                                     topic: String,
+                                     group: String,
+                                     startAtEnd: Boolean = false)
+
+  case class RunnableKafkaWorkerSharedState(syncPoint: LinkedTransferQueue[AckableMessage], // read/write
+                                            outstandingAcks: LinkedBlockingQueue[Acknowledgement], // read/write
+                                            shutdownIndicator: () => Boolean, // read
+                                            failureHandler: () => FailureHandler) // read
 
 
   class RunnableKafkaWorker(kafkaConnectionSettings: KafkaConnectionSettings,
@@ -93,54 +94,16 @@ object ClientImpl {
     // keep an eye on whether we're idle, so we can commit when we have nothing better to do.
     var lastActivity = System.currentTimeMillis()
 
-    def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
+    private def okToCommit = msgOnOffer.isEmpty && outstandingMessages.isEmpty && consumer.consumedCount > 0
 
+    private def isBored = consumer.consumedCount > 0 &&
+      System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis
 
     override def run(): Unit = {
       while (!sharedState.shutdownIndicator()) {
         //println(s"looping. consumedCount: ${consumer.consumedCount}, failed msgs: ${failedMessages.size}, acks unprocessed: ${outstandingAcks.size()}, outstanding: ${outstandingMessages.size}, msgOnOffer: $msgOnOffer")
 
-        // do housekeeping (and possibly commit) if we've crossed a threshold of outstanding messages,
-        // or if we apparently don't have anything better to do
-        if (consumer.consumedCount >= desiredCommitThreshold
-          || (consumer.consumedCount > 0 && System.currentTimeMillis() - lastActivity > opportunisticCommitIdleDelay.toMillis)) {
-
-          // gather acks seen so far
-          val processingAcks = mutable.ListBuffer[Acknowledgement]()
-          sharedState.outstandingAcks.drainTo(processingAcks.asJava)
-
-          // remove acks from outstandingMessages
-          for { ack <- processingAcks
-                msg <- outstandingMessages.remove(ack.id) } ack.ackType match {
-            case ACK => Unit
-            case unsuccessfulAckCode =>
-              failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
-          }
-
-          // remove outstanding messages whose acks have expired
-          // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
-          val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
-          outstandingMessages.foreach {
-            case (id, ackableMsg) => {
-              if (ackableMsg.timestamp < expiredThreshold) {
-                // return Cancellable futures and notify
-                failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
-                outstandingMessages.remove(id)
-              }
-            }
-          }
-
-          // commit if possible
-          if (okToCommit) {
-            if (failedMessages.nonEmpty) {
-              // Block this thread's execution until the failureHandler completes.
-              // Exceptions during failureHandler execution escalate, and terminates all message processing.
-              sharedState.failureHandler()(failedMessages.toList)
-            }
-            consumer.commit()
-            failedMessages.clear()
-          }
-        }
+        if (consumer.consumedCount >= desiredCommitThreshold || isBored) doHousekeeping()
 
         // if we've exceeded the hard-commit threshold, stop giving out messages until we can commit,
         // which may not happen until all the outstanding messages time out
@@ -153,8 +116,8 @@ object ClientImpl {
               val nextMsg: AckableMessage = msgOnOffer.getOrElse(AckableMessage(Random.nextLong(), consumer.next(), 0)).copy(timestamp = System.currentTimeMillis())
               msgOnOffer = None
               if (!sharedState.syncPoint.tryTransfer(nextMsg))
-                // Contrary to our previous understanding, there's nobody around,
-                // so see if we can do some other work and try again later
+              // Contrary to our previous understanding, there's nobody around,
+              // so see if we can do some other work and try again later
                 msgOnOffer = Some(nextMsg)
               else {
                 lastActivity = System.currentTimeMillis()
@@ -174,14 +137,57 @@ object ClientImpl {
       // TODO: shut the consumer down?
     }
 
+    /**
+     * Processes all acks seen so far, removes acks that have expired, enqueue failure messages if unsuccessful
+     * acks are seen. Possibly commits if its 'okToCommit'
+     */
+    private def doHousekeeping(): Unit = {
+      // gather acks seen so far
+      val processingAcks = mutable.ListBuffer[Acknowledgement]()
+      sharedState.outstandingAcks.drainTo(processingAcks.asJava)
+
+      // remove acks from outstandingMessages
+      for {
+        ack <- processingAcks
+        msg <- outstandingMessages.remove(ack.id)
+      } ack.ackType match {
+        case ACK => Unit
+        case unsuccessfulAckCode =>
+          failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
+      }
+
+      // remove outstanding messages whose acks have expired
+      // TODO: If we gave outstandingMessages an ordering, we would be able to shortcut the loop
+      val expiredThreshold = System.currentTimeMillis() - ackTimeout.toMillis
+      outstandingMessages.foreach {
+        case (id, ackableMsg) =>
+          if (ackableMsg.timestamp < expiredThreshold) {
+            // return Cancellable futures and notify
+            failedMessages.enqueue(AckedMessage(Ack.TIMEOUT, ackableMsg.msg))
+            outstandingMessages.remove(id)
+          }
+      }
+
+      // commit if possible
+      if (okToCommit) {
+        if (failedMessages.nonEmpty) {
+          // Block this thread's execution until the failureHandler completes.
+          // Exceptions during failureHandler execution escalate, and terminates all message processing.
+          sharedState.failureHandler()(failedMessages.toList)
+        }
+        consumer.commit()
+        failedMessages.clear()
+      }
+    }
   }
+
 }
 
 
 class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThreshold: Int = 100, startAtEnd: Boolean = false) {
   import ClientImpl._
 
-  val timeout = 3.second  // how long to wait for an Ack
+  val timeout = 3.second // how long to wait for an Ack
 
   // these should be the ONLY pieces of /mutable/ shared data between this class and the RunnableKafkaWorker
   private val syncPoint = new LinkedTransferQueue[AckableMessage]()
@@ -223,9 +229,14 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
     t
   }
 
-  private val t: Thread = newWorkerThread()   // TODO: Attempt to replace it if it stops?
+  private val t: Thread = newWorkerThread() // TODO: Attempt to replace it if it stops?
 
-  // uses the caller's execution context to create a future message
+  /**
+   * Get the next message from the kafka topic
+   * @param ec implicit execution context used to create the future
+   * @return Future containing an AckableMessage with the message from Kafka. This message should be acked at some
+   *         point in the future by the caller
+   */
   def next(implicit ec: ExecutionContext): Future[AckableMessage] = {
     if (workerException.isDefined) {
       throw workerException.get
@@ -234,14 +245,36 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
       throw new RuntimeException("Client worker is not running")
     }
     Future {
-      syncPoint.take
+      //This can block, let the execution context take care of it
+      //TODO: make default blocking execution context to provide to the users
+      blocking { syncPoint.take }
     }
   }
 
+  /**
+   * Ack a message with a particular id and type
+   * @param id Id of message to Ack
+   * @param ackType Type of ack this is (fail, ack, nack, etc.)
+   */
   def ack(id: Long, ackType: Ack.AckType): Unit = ack(Ack(id, ackType))
+
+  /**
+   * Acks a message
+   * @param ack Ack object containing info needed to ack a particular message
+   */
   def ack(ack: Acknowledgement): Unit = outstandingAcks.put(ack)
 
+  /**
+   * Create and start a ClientImpl with the default failure handler (IgnoreFailuresHandler, which throws away all failures)
+   * @return The created and started ClientImpl
+   */
   def start(): ClientImpl = start(ignoreFailuresHandler)
+
+  /**
+   * Create and start a ClientImpl with the user defined failure handler
+   * @param handler Function that takes a list of failed AckedMessages and does something with them
+   * @return Created and started ClientImpl
+   */
   def start(handler: FailureHandler): ClientImpl = {
     require(!running || handler == failureHandler, "Can't change the failure handler after start")
 
@@ -249,7 +282,16 @@ class ClientImpl(zk: String, topic: String, group: String, val desiredCommitThre
     t.start()
     this
   }
+
+  /**
+   * @return true if the ClientImpl is running, false otherwise
+   */
   def running(): Boolean = t.isAlive
+
+  /**
+   * Shutdown the ClientImpl
+   * @return itself
+   */
   def shutdown() = {
     shuttingDown = true
     t.join()
