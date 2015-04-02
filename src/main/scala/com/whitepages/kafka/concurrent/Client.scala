@@ -150,7 +150,7 @@ object ClientImpl {
       for {
         ack <- processingAcks
         msg <- outstandingMessages.remove(ack.id)
-      } yield ack.ackType match {
+      } ack.ackType match {
         case ACK => Unit
         case unsuccessfulAckCode =>
           failedMessages.enqueue(AckedMessage(unsuccessfulAckCode, msg.msg))
