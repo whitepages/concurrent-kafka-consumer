@@ -1,5 +1,6 @@
 package com.whitepages.kafka.concurrent
 
+
 object Ack {
   type AckType = Int
   val ACK: AckType = 1
@@ -12,5 +13,11 @@ object Ack {
 
   case class Acknowledgement(id: Long, ackType: AckType)
   def apply(id: Long, ackType: AckType) = new Acknowledgement(id, ackType)
+
+  case class AckableMessage[T](id: Long, msg: T, timestamp: Long)
+  case class AckedMessage[T](ackType: AckType, msg: T)
 }
+
+
+
 
