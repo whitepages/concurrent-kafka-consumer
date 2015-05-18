@@ -20,10 +20,8 @@ fork in run := true
 resolvers += "whitepages-snapshots" at "http://jrepo0.dev.pages:8081/artifactory/whitepages-snapshots"
 
 libraryDependencies ++= Seq(
-  // this should get pulled in by wp-kafka-consumer-scala, but something screws up in the test context without the explicit inclusion
   "org.apache.kafka" %% "kafka"                 % "0.8.2.0",
-  "com.whitepages" %% "wp-kafka-consumer-scala" % "0.0.7-SNAPSHOT",
-  "com.whitepages" %% "scala-test"              % "9.0.2"      % "test",
+  "org.scalatest" %% "scalatest" % "2.1.7",
   "org.apache.kafka" %% "kafka"                 % "0.8.2.0" % "test" classifier "test"
 )
 

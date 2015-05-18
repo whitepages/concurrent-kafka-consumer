@@ -1,15 +1,12 @@
 package com.whitepages.kafka.concurrent
 
-import com.whitepages.kafka.consumer.ByteConsumer
-import com.whitepages.kafka.consumer.Consumer.Settings
-import com.whitepages.kafka.producer.ByteProducer
+import java.util.Properties
+
+import kafka.producer.{ProducerConfig, KeyedMessage}
 import kafka.server.{RunningAsController, RunningAsBroker, KafkaConfig, KafkaServer}
 import kafka.utils.{ZkUtils, ZKStringSerializer, TestUtils, TestZKUtils}
 import kafka.zk.EmbeddedZookeeper
 import org.I0Itec.zkclient.ZkClient
-import org.slf4j.{LoggerFactory, Logger}
-
-import scala.util.Random
 
 trait MockZk {
   val zkConnect: String = TestZKUtils.zookeeperConnect
@@ -59,28 +56,21 @@ class MockKafka extends MockZk {
 
 }
 
-class TestConsumer(zk: String, fromTopic: String, startAtEnd: Boolean = false) extends ByteConsumer {
-  override def logger: Logger = LoggerFactory.getLogger(this.getClass)
-
-  override def settings: Settings = Settings(zk, "test-consumer-group-" + Random.nextInt, fromTopic, autoCommit = false)
-
-  override def defaultProperties = {
-    val defaults = super.defaultProperties
-
-    if (startAtEnd) defaults.setProperty("auto.offset.reset", "largest")
-    defaults.setProperty("consumer.timeout.ms", "3000")
-    defaults
+class TestProducer(topic: String, brokers: String) {
+  def properties: Properties = {
+    val props = new Properties()
+    props.put("metadata.broker.list", brokers)
+    props.put("request.required.acks", "-1")
+    props.put("producer.type", "async")
+    props.put("partitioner.class", "kafka.producer.DefaultPartitioner")
+    props.put("key.serializer.class", "kafka.serializer.StringEncoder")
+    props
   }
-}
-class TestProducer(topic: String, brokers: String)
-  extends ByteProducer(topic, brokers) {
+  private lazy val config = new ProducerConfig(properties)
+  private lazy val connector = new kafka.producer.Producer[String, Array[Byte]](config)
 
-  override def defaultProperties = {
-    val defaults = super.defaultProperties
-
-    defaults.setProperty("producer.type", "sync")
-    defaults.setProperty("partitioner.class", "kafka.producer.DefaultPartitioner")
-    defaults.setProperty("key.serializer.class", "kafka.serializer.StringEncoder")
-    defaults
+  def send(msgs: IndexedSeq[KeyedMessage[String, Array[Byte]]]) = {
+    internalSend(msgs.map { (m) => new KeyedMessage[String, Array[Byte]](topic, m.key, m.message) })
   }
+  private def internalSend(messages: Seq[KeyedMessage[String, Array[Byte]]]): Unit = connector.send(messages: _*)
 }
